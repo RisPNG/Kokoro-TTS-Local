@@ -1,208 +1,279 @@
-"""
-Kokoro-TTS Local Generator
--------------------------
-A Gradio interface for the Kokoro-TTS system with automatic detection for Japanese voices.
-"""
-
-import gradio as gr
 import os
 import sys
 import platform
 from datetime import datetime
-import shutil
 from pathlib import Path
-import soundfile as sf
-from pydub import AudioSegment
+
 import torch
 import numpy as np
+import soundfile as sf
+from pydub import AudioSegment
+import gradio as gr
 
-# Import your custom modules
-from models import list_available_voices, build_model, generate_speech
+#############################################
+# 1) IMPORT THE KPipeline + MODEL
+#############################################
 
-# For Japanese pipeline
+# This assumes you have KPipeline (and KModel) in a local module called kokoro
+# containing exactly the code from your KPipeLine snippet in your question.
+# Adjust your import to match your actual file structure.
+
+# e.g. from kokoro.pipeline import KPipeline, KModel
+# or simply:
 from kokoro import KPipeline
+from kokoro.model import KModel
 
-# Global configuration
-CONFIG_FILE = "tts_config.json"
+
+#############################################
+# 2) MAP VOICES → LANG CODE, CREATE PIPELINE DICT
+#############################################
+
+# According to VOICES.md, we can detect the language by the prefix:
+LANG_MAP = {
+    # American English
+    "af_": "a",
+    "am_": "a",
+
+    # British English
+    "bf_": "b",
+    "bm_": "b",
+
+    # Japanese
+    "jf_": "j",
+    "jm_": "j",
+
+    # Mandarin Chinese
+    "zf_": "z",
+    "zm_": "z",
+
+    # Spanish
+    "ef_": "e",
+    "em_": "e",
+
+    # French
+    "ff_": "f",
+
+    # Hindi
+    "hf_": "h",
+    "hm_": "h",
+
+    # Italian
+    "if_": "i",
+    "im_": "i",
+
+    # Brazilian Portuguese
+    "pf_": "p",
+    "pm_": "p",
+}
+
+# Keep a global dictionary of {lang_code -> pipeline}
+pipelines = {}
+
+# If you want a single KModel for *all* languages (to share GPU memory)
+global_model = None
+
 DEFAULT_OUTPUT_DIR = "outputs"
 SAMPLE_RATE = 24000
 
-# Initialize model globally
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = None
 
-# Create a global pipeline for Japanese voices
-jp_pipeline = None
+#############################################
+# 3) PLACEHOLDERS FOR ANY MISSING LOGIC
+#############################################
 
-# Example set of known Japanese voices
-JAPANESE_VOICES = ["jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"]
-# You can expand or modify based on your use case.
-
-
-def get_available_voices():
-    """Get list of available voice models."""
-    global model
-    try:
-        # Initialize model once if needed to trigger voice downloads
-        if model is None:
-            print("Initializing main (non-Japanese) model...")
-            model = build_model(None, device)
-
-        voices = list_available_voices()
-        if not voices:
-            print("No voices found after initialization. Attempting to download...")
-            download_voice_files()  # Assuming you have a function that downloads voice files
-            voices = list_available_voices()
-
-        print("Available voices:", voices)
-        return voices
-    except Exception as e:
-        print(f"Error getting voices: {e}")
-        return []
+def list_available_voices():
+    """
+    Placeholder. Return a list of all voice names (like 'af_heart', 'bf_alice', etc.)
+    that you have in your local environment or HF hub.
+    """
+    # You can do a local directory listing, or a curated list:
+    return [
+        "af_heart", "af_alloy", "af_aoede", "af_bella", "am_adam", 
+        "bf_alice", "bf_emma", "bm_daniel", "bm_george",
+        "jf_alpha", "jm_kumo", "zf_xiaobei", "zm_yunjian",
+        "ef_dora", "em_alex", "ff_siwis", "hf_alpha", "hm_omega",
+        "if_sara", "im_nicola", "pf_dora", "pm_santa",
+    ]
 
 
-def convert_audio(input_path: str, output_path: str, fmt: str):
-    """Convert audio to specified format."""
-    try:
-        if fmt == "wav":
-            return input_path
-        audio = AudioSegment.from_wav(input_path)
-        if fmt == "mp3":
-            audio.export(output_path, format="mp3", bitrate="192k")
-        elif fmt == "aac":
-            audio.export(output_path, format="aac", bitrate="192k")
-        return output_path
-    except Exception as e:
-        print(f"Error converting audio: {e}")
+def build_model(config, device):
+    """
+    Placeholder. Suppose you want to load a single large KModel:
+    """
+    print("[build_model] Loading KModel onto device:", device)
+    model = KModel().to(device).eval()
+    return model
+
+
+#############################################
+# 4) HELPER FUNCTIONS
+#############################################
+
+def get_pipeline_for_voice(voice_name: str) -> KPipeline:
+    """
+    From the voice name's prefix (e.g. 'af_', 'jf_'), figure out
+    the correct language code and return or create the KPipeline.
+    """
+    # Try the first 3 chars, fallback to American English if unknown
+    prefix = voice_name[:3].lower()
+    lang_code = LANG_MAP.get(prefix, "a")
+
+    if lang_code not in pipelines:
+        print(f"[INFO] Creating pipeline for lang_code='{lang_code}'")
+        # If we want one shared KModel for everything:
+        if global_model is not None:
+            pipelines[lang_code] = KPipeline(lang_code=lang_code, model=global_model)
+        else:
+            # This pipeline will create its own KModel
+            pipelines[lang_code] = KPipeline(lang_code=lang_code, model=True)
+    return pipelines[lang_code]
+
+
+def convert_audio(input_path: str, output_path: str, fmt: str) -> str:
+    """
+    Convert .wav file to mp3/aac if needed. If 'fmt' is 'wav', do nothing.
+    """
+    if fmt == "wav":
         return input_path
 
+    audio = AudioSegment.from_wav(input_path)
+    if fmt == "mp3":
+        audio.export(output_path, format="mp3", bitrate="192k")
+    elif fmt == "aac":
+        audio.export(output_path, format="aac", bitrate="192k")
+    else:
+        print(f"[convert_audio] Unrecognized format: {fmt}, leaving WAV as-is.")
+        return input_path
 
-def generate_tts_with_logs(voice_name, text, fmt):
-    """Generate TTS audio with progress logging and auto-detection for Japanese voices."""
-    global model
-    global jp_pipeline
+    return output_path
 
+
+#############################################
+# 5) MAIN TTS GENERATION LOGIC
+#############################################
+
+def generate_tts_with_logs(voice_name: str, text: str, fmt: str) -> str:
+    """
+    Generate speech for the given text & voice, auto-selecting the right pipeline.
+    Return the path to the resulting audio file (either .wav, .mp3, or .aac).
+    """
     try:
-        # Prepare directories
         os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
-        # Build the Japanese pipeline if it's a Japanese voice and pipeline hasn't been built yet
-        if voice_name in JAPANESE_VOICES:
-            if jp_pipeline is None:
-                print("Initializing Japanese pipeline (KPipeline, lang_code='j')...")
-                jp_pipeline = KPipeline(lang_code="j")
-        else:
-            # Fallback to English / standard pipeline if not yet built
-            if model is None:
-                print("Initializing main pipeline model...")
-                model = build_model(None, device)
+        # 1) Choose the pipeline
+        pipeline = get_pipeline_for_voice(voice_name)
 
-        # Generate a timestamped filename
+        # 2) Timestamped filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = f"tts_{timestamp}"
+        base_name = f"tts_{voice_name}_{timestamp}"
         wav_path = os.path.join(DEFAULT_OUTPUT_DIR, f"{base_name}.wav")
 
-        # --- MAIN LOGIC: Choose which pipeline to use based on voice_name ---
-        if voice_name in JAPANESE_VOICES:
-            # Use Japanese pipeline
-            print(
-                f"\n[JP] Generating Japanese speech for '{text}' with voice={voice_name}"
-            )
-            # The pipeline returns a generator. Typically you’d do:
-            generator = jp_pipeline(
-                text,
-                voice=f"voices/{voice_name}.pt",  # Adjust if you store .pt files differently
-                speed=1.0,
-                split_pattern=r"\n+",
-            )
+        print(f"\n[INFO] Generating TTS with voice='{voice_name}', text='{text}'")
 
-            all_audio = []
-            # If your JP pipeline yields (gs, ps, audio), iterate:
-            for gs, ps, audio in generator:
-                if audio is not None:
-                    if isinstance(audio, np.ndarray):
-                        audio = torch.from_numpy(audio).float()
-                    all_audio.append(audio)
-                    print(f"Generated segment (JP): {gs}")
-                    print(f"Phonemes (JP): {ps}")
+        # 3) Call pipeline → generator of KPipeline.Result
+        results_gen = pipeline(
+            text,
+            voice=voice_name,   # e.g. "af_heart"
+            speed=1.0,
+            split_pattern=r"\n+",
+        )
 
-        else:
-            # Use the standard pipeline
-            print(
-                f"\n[EN/Other] Generating speech for '{text}' with voice={voice_name}"
-            )
-            generator = model(
-                text,
-                voice=f"voices/{voice_name}.pt",  # Adjust to match your file structure
-                speed=1.0,
-                split_pattern=r"\n+",
-            )
+        all_audio = []
+        for result in results_gen:
+            # result is an instance of KPipeline.Result
+            audio_tensor = result.audio
+            if audio_tensor is not None:
+                # Move to CPU, ensure float
+                if not isinstance(audio_tensor, torch.Tensor):
+                    audio_tensor = torch.tensor(audio_tensor, dtype=torch.float32)
+                audio_tensor = audio_tensor.float().cpu()
+                all_audio.append(audio_tensor)
 
-            all_audio = []
-            for gs, ps, audio in generator:
-                if audio is not None:
-                    if isinstance(audio, np.ndarray):
-                        audio = torch.from_numpy(audio).float()
-                    all_audio.append(audio)
-                    print(f"Generated segment: {gs}")
-                    print(f"Phonemes: {ps}")
+                # Debug logs
+                print(f"[Segment] Graphemes: {result.graphemes}")
+                print(f"[Segment] Phonemes:  {result.phonemes}")
 
         if not all_audio:
-            raise Exception("No audio segments were generated.")
+            raise RuntimeError("No audio segments generated.")
 
-        # Combine all audio segments
+        # 4) Concatenate all audio
         final_audio = torch.cat(all_audio, dim=0)
-        sf.write(wav_path, final_audio.numpy(), SAMPLE_RATE)
 
-        # Convert to requested format if needed
+        # 5) Write to .wav
+        sf.write(wav_path, final_audio.numpy(), SAMPLE_RATE)
+        print(f"[INFO] Wrote WAV: {wav_path}")
+
+        # 6) Convert if needed
         if fmt != "wav":
-            output_path = os.path.join(DEFAULT_OUTPUT_DIR, f"{base_name}.{fmt}")
-            return convert_audio(wav_path, output_path, fmt)
+            out_file = os.path.join(DEFAULT_OUTPUT_DIR, f"{base_name}.{fmt}")
+            out_file = convert_audio(wav_path, out_file, fmt)
+            print(f"[INFO] Converted to: {out_file}")
+            return out_file
 
         return wav_path
 
     except Exception as e:
-        print(f"Error generating speech: {e}")
+        print(f"[ERROR] generate_tts_with_logs: {e}")
         import traceback
-
         traceback.print_exc()
-        return None
+        return ""
 
+
+#############################################
+# 6) GRADIO INTERFACE
+#############################################
 
 def create_interface(server_name="0.0.0.0", server_port=7860):
-    """Create and launch the Gradio interface."""
-    voices = get_available_voices()
-    if not voices:
-        print("No voices found! Please check the voices directory.")
-        return
+    """
+    Build a Gradio UI for Kokoro TTS.
+    """
+    # Optionally pre-initialize a single global model if you like
+    global global_model
+    if global_model is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        global_model = build_model(None, device)
 
-    with gr.Blocks(title="Kokoro TTS Generator") as interface:
-        gr.Markdown("# Kokoro TTS Generator")
+    # List your voices (from local or your metadata)
+    voices = list_available_voices()
+
+    with gr.Blocks(title="Kokoro TTS Generator - Multi-Lingual") as interface:
+        gr.Markdown("# Kokoro TTS Generator (Multi-Language)")
 
         with gr.Row():
             with gr.Column():
-                voice = gr.Dropdown(
-                    choices=voices, value=voices[0] if voices else None, label="Voice"
+                voice_box = gr.Dropdown(
+                    choices=voices, 
+                    value=voices[0] if voices else None, 
+                    label="Voice"
                 )
-                text = gr.Textbox(
+                text_box = gr.Textbox(
                     lines=3,
                     placeholder="Enter text to convert to speech...",
                     label="Text",
                 )
-                fmt = gr.Radio(
-                    choices=["wav", "mp3", "aac"], value="wav", label="Output Format"
+                fmt_radio = gr.Radio(
+                    choices=["wav", "mp3", "aac"],
+                    value="wav",
+                    label="Output Format"
                 )
-                generate = gr.Button("Generate Speech")
+                generate_button = gr.Button("Generate Speech")
 
             with gr.Column():
-                output = gr.Audio(label="Generated Audio")
+                output_audio = gr.Audio(label="Generated Audio")
 
-        generate.click(
-            fn=generate_tts_with_logs, inputs=[voice, text, fmt], outputs=output
+        # Wiring: generate_button calls generate_tts_with_logs
+        # We'll feed the resulting file path back to the Audio component
+        generate_button.click(
+            fn=generate_tts_with_logs,
+            inputs=[voice_box, text_box, fmt_radio],
+            outputs=output_audio
         )
 
     interface.launch(server_name=server_name, server_port=server_port, share=True)
 
 
+#############################################
+# 7) MAIN ENTRY POINT
+#############################################
+
 if __name__ == "__main__":
-    create_interface()
+    create_interface(server_name="0.0.0.0", server_port=7860)
